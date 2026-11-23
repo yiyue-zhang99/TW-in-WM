@@ -96,12 +96,12 @@ def average_maps(trials, *, split_by=None, flip=None):
         maps = {'subjects': subject ids, 'time': s, 'frequencies': Hz,
                 'values': {'fw' / 'bw': {group: subjects × frequencies × times, dB}}}.
     """
-    trials = trials.assign(condition=trials[split_by] if split_by else 'all')
     session_maps = defaultdict(lambda: defaultdict(list))
     for file, file_trials in trials.groupby('file', sort=False):
         time, frequencies, power = _read_power(file)
         subject = file_trials['subject'].iloc[0]  # one file = one session of one subject
-        for condition, condition_trials in file_trials.groupby('condition', sort=False):
+        groups = file_trials.groupby(split_by, sort=False) if split_by else [('all', file_trials)]
+        for condition, condition_trials in groups:
             session_maps[condition][subject].append(_session_means(power, condition_trials, flip))
 
     result = {}
@@ -273,8 +273,7 @@ def plot_tf_maps(maps, *, color_limit, t_start, t_stop, time_zero, events, outpu
     """Plot and save contra − ipsi TF maps up to 30 Hz (fw left, bw right); print the clusters.
 
     Args:
-        maps: {'subjects': subject ids, 'time': s, 'frequencies': Hz,
-                'values': {'fw' / 'bw': {group: subjects × frequencies × times, dB}}}.
+        maps: what average_maps returns; it must hold a single condition (no split_by).
         color_limit: color bar.
         t_start, t_stop: time window to plot and test (s).
         time_zero: time (s) shown as 0 ms on the time axis.
@@ -284,13 +283,14 @@ def plot_tf_maps(maps, *, color_limit, t_start, t_stop, time_zero, events, outpu
         n_perm, seed, alpha: cluster test settings.
         rt_lines: [(time s, color)] colored dashed lines.
     """
-    in_window = (maps['time'] >= t_start) & (maps['time'] <= t_stop)
-    in_range = maps['frequencies'] <= 30  # Hz
-    time, frequencies = maps['time'][in_window], maps['frequencies'][in_range]
+    (condition_maps,) = maps.values()  # a TF figure shows one condition
+    in_window = (condition_maps['time'] >= t_start) & (condition_maps['time'] <= t_stop)
+    in_range = condition_maps['frequencies'] <= 30  # Hz
+    time, frequencies = condition_maps['time'][in_window], condition_maps['frequencies'][in_range]
     fig, axes = plt.subplots(1, len(MEASURES), figsize=(12.8, 4.8))
     for ax, measure in zip(axes, MEASURES):
         # subjects × frequencies × times, cut to ≤ 30 Hz and the time window
-        values = maps['values'][measure]['difference'][:, in_range][:, :, in_window]
+        values = condition_maps['values'][measure]['difference'][:, in_range][:, :, in_window]
         mean = values.mean(axis=0)  # average over subjects (axis 0): frequencies × times
         image = ax.pcolormesh(time, frequencies, mean, shading='auto', cmap='coolwarm',
                               vmin=-color_limit, vmax=color_limit)
@@ -319,15 +319,14 @@ def plot_tf_maps(maps, *, color_limit, t_start, t_stop, time_zero, events, outpu
     plt.show()
 
 
-def plot_band_timeseries(conditions, *, group, freq_bands, ylim, t_start, t_stop, time_zero,
+def plot_band_timeseries(maps, *, group, freq_bands, ylim, t_start, t_stop, time_zero,
                          events, output_dir, name, n_perm, seed, alpha, tests=None, bonferroni=False,
                          layout='rows', legend_title=None, colors=None,
                          panel_size=None, event_fontsize=10, rt_lines=()):
     """Plot and save band-power time courses (mean ± 95% CI) with cluster bars; print the clusters.
 
     Args:
-        conditions: {condition: maps} from average_maps; one curve per
-            condition. For a single condition pass {'all': maps}.
+        maps: what average_maps returns; one curve per condition.
         group: 'difference' (contra − ipsi), 'midline' or 'all_lines' .
         freq_bands: FREQ_BANDS or some of its bands.
         ylim: (bottom, top) of the power axis, in dB.
@@ -348,9 +347,9 @@ def plot_band_timeseries(conditions, *, group, freq_bands, ylim, t_start, t_stop
         rt_lines: [(time s, color)] colored dashed lines, e.g. mean RTs.
     """
     if tests is None:
-        tests = [(condition, None) for condition in conditions]
+        tests = [(condition, None) for condition in maps]
     correction = len(tests) if bonferroni else 1
-    single = len(conditions) == 1
+    single = len(maps) == 1
 
     directions_in_columns = layout == 'columns'
     nrows, ncols = ((len(freq_bands), len(MEASURES)) if directions_in_columns
@@ -361,7 +360,7 @@ def plot_band_timeseries(conditions, *, group, freq_bands, ylim, t_start, t_stop
     bottom_row = list(grid[-1])  # only these panels get event labels
     axes = grid.T if directions_in_columns else grid  # axes[direction_index, band_index]
 
-    first_maps = list(conditions.values())[0]  # every condition has the same time and frequencies
+    first_maps = list(maps.values())[0]  # every condition has the same time and frequencies
     in_window = (first_maps['time'] >= t_start) & (first_maps['time'] <= t_stop)
     time = first_maps['time'][in_window]
     for direction_index, measure in enumerate(MEASURES):
@@ -370,9 +369,9 @@ def plot_band_timeseries(conditions, *, group, freq_bands, ylim, t_start, t_stop
             ax = axes[direction_index, band_index]
             in_band = (first_maps['frequencies'] >= low) & (first_maps['frequencies'] <= high)
             band_power = {}
-            for condition, maps in conditions.items():
+            for condition, condition_maps in maps.items():
                 # subjects × frequencies × times → subjects × times 
-                values = maps['values'][measure][group][:, in_band][:, :, in_window].mean(axis=1)
+                values = condition_maps['values'][measure][group][:, in_band][:, :, in_window].mean(axis=1)
                 band_power[condition] = values
                 mean, half_width = _mean_ci95(values)  # values: subjects × times
                 color = MEASURE_COLORS[measure] if single else colors[condition]
@@ -412,8 +411,8 @@ def plot_band_timeseries(conditions, *, group, freq_bands, ylim, t_start, t_stop
 
     if not single:
         # One legend entry per condition (curve color), then one per comparison (bar color).
-        labels = [str(condition) for condition in conditions]
-        line_colors = [colors[condition] for condition in conditions]
+        labels = [str(condition) for condition in maps]
+        line_colors = [colors[condition] for condition in maps]
         comparisons = [(first, second) for first, second in tests if second is not None]
         for first, second in comparisons:
             labels.append('Difference' if len(comparisons) == 1 else f'{first} vs {second}')
