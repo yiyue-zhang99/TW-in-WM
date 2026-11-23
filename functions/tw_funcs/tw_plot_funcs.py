@@ -1,88 +1,166 @@
-"""Shared TW plots: input times in seconds, displayed times in milliseconds."""
+"""Travelling-wave (TW) power plots shared by the Guven, Michael and Mingmin notebooks.
+
+Pipeline:
+    average_maps          per condition: one power map per subject and line group
+    plot_tf_maps          time-frequency maps with cluster outlines
+    plot_band_timeseries  band-power time courses with 95% CIs and cluster bars
+"""
+import pickle
+from collections import defaultdict
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-from matplotlib.ticker import FuncFormatter, MaxNLocator
-from matplotlib.lines import Line2D
 import numpy as np
-from scipy import stats
+from matplotlib.lines import Line2D
+from matplotlib.ticker import FuncFormatter, MaxNLocator
 from mne.stats import permutation_cluster_1samp_test
+from scipy import stats
 
+MEASURES = ('fw', 'bw')
 DIRECTION_TITLES = {'fw': 'Forward TW', 'bw': 'Backward TW'}
+MEASURE_COLORS = {'fw': '#1f77b4', 'bw': '#ff7f0e'}
+# Every TW file has 11 electrode lines in this order: C5 … C1, M, I1 … I5 (indices 0–10).
+LINE_GROUPS = {'contra': [0, 1, 2, 3, 4], 'ipsi': [6, 7, 8, 9, 10], 'midline': [5],
+               'all_lines': list(range(11))}
 
-def normalize_power(fw, fw_surrogate, bw, bw_surrogate):
-    arrays = {'fw': 10 * np.log10(fw / fw_surrogate), 'bw': 10 * np.log10(bw / bw_surrogate)}
-    return arrays
 
+# ---------------------------------------------------------------- data
 
-def collect_maps(sessions, *, groups, align, weighting='session'):
-    """Average nonempty trial selections within subjects.
-
-    weighting='session' weights sessions equally; 'trial' pools trials.
+def _read_power(path):
+    """Read one session's TW result file: time (s), frequencies (Hz), fw / bw power in dB.
     """
-    sums, weights, counts, response_times = {}, {}, {}, {}
-    for session in sessions:
-        time, frequencies = session['time'], session['frequencies']
-        for condition, keep in session['selections'].items():
-            n = int(keep.sum())
-            # A session may contain only one experimental condition.
-            # An absent condition contributes neither a mean nor a session weight.
-            if n == 0:
-                continue
-            key = (condition, session['subject'])
-            weight = 1 if weighting == 'session' else n
-            weights[key] = weights.get(key, 0) + weight
-            counts[key] = counts.get(key, 0) + n
-            for name, rt in session['rt'].items():
-                response_times.setdefault((condition, session['subject'], name), []).append(rt[keep])
-            for measure, power in session['power'].items():
-                selected = power[..., keep].copy()
-                if align:
-                    flip = session['flip'][keep]
-                    selected[..., flip] = selected[::-1, ..., flip]
-                line_means = selected.mean(axis=-1)
-                for group, indices in groups.items():
-                    value = line_means[indices].mean(axis=0)
-                    entry = (condition, session['subject'], measure, group)
-                    sums[entry] = sums.get(entry, 0) + weight*value
-    if not weights:
-        raise ValueError('No valid trials remain in any selected condition.')
-    conditions = sorted({key[0] for key in weights}, key=str)
-    measures = sorted({key[2] for key in sums})
+    with open(path, 'rb') as stream:
+        data = pickle.load(stream)
+    # Guven files keep the TW function's own field names; rename them to the Michael / Mingmin names.
+    guven_to_common = {'fwMax': 'fwmax', 'fwMaxSS': 'fwssmax', 'bwMax': 'bwmax', 'bwMaxSS': 'bwssmax',
+                       'starts': 'time'}
+    data = {guven_to_common.get(name, name): value for name, value in data.items()}
+
+    time = -1.2 + (np.asarray(data['time'])+125)/500
+    power = {'fw': 10*np.log10(data['fwmax']/data['fwssmax']),
+             'bw': 10*np.log10(data['bwmax']/data['bwssmax'])}
+    return time, np.asarray(data['ff']), power
+
+
+def _session_means(power, trials, flip):
+    """Average one session's selected trials, then the lines of each group in LINE_GROUPS.
+
+    Args:
+        power: {measure: lines × frequencies × times × trials} of one session.
+        trials: the selected trials of that session (rows of the trials table; uses the
+            `trial` and flip columns).
+        flip: name of the True / False flip column, or None.
+
+    Returns:
+        {(measure, group): frequencies × times}.
+    """
+    means = {}
+    for measure, measure_power in power.items():
+        selected = measure_power[..., trials['trial'].to_numpy()].copy()
+        if flip:
+            flipped = trials[flip].to_numpy()
+            selected[..., flipped] = selected[::-1, ..., flipped]  # reverse the line axis
+        line_means = selected.mean(axis=-1)  # lines × frequencies × times
+        for group, lines in LINE_GROUPS.items():
+            means[measure, group] = line_means[lines].mean(axis=0)
+    return means
+
+
+def _subject_mean(sessions, key):
+    """Mean of a subject's session means; every session counts the same."""
+    return sum(means[key] for means in sessions) / len(sessions)
+
+
+def average_maps(trials, *, split_by=None, flip=None):
+    """Average trials into one map per subject, condition and line group.
+
+    A subject's map is the mean of its session means, so every session counts the same. In
+    Michael each session has one cue side, so this weights both cue sides equally.
+
+    Args:
+        trials: rows of the notebook's trials table (made by read_trials), one per trial to use:
+
+                file                                subject  trial  block  early_left
+                .../mingmin_fft/subj01_sess1.pkl          1      6  fixed       False
+                .../mingmin_fft/subj01_sess1.pkl          1     13  fixed        True
+                .../mingmin_fft/subj01_sess2.pkl          1      3  random      False
+
+            `file` is the session's TW result file, `trial` the trial's index in it.
+        split_by: 'rotation' (Guven), 'block' (Mingmin), 'speed' (Michael, Mingmin),
+            'hand_target' (Michael), or None for one condition 'all'.
+        flip: 'cue_left' (Guven, Michael), 'early_left' / 'late_left' (Michael, Mingmin),
+            or None; True trials get the line order reversed.
+
+    Returns:
+        {condition: maps}, one key per value of the split_by column ('all' if None), where
+        maps = {'subjects': subject ids, 'time': s, 'frequencies': Hz,
+                'values': {'fw' / 'bw': {group: subjects × frequencies × times, dB}}}.
+    """
+    trials = trials.assign(condition=trials[split_by] if split_by else 'all')
+    session_maps = defaultdict(lambda: defaultdict(list))
+    for file, file_trials in trials.groupby('file', sort=False):
+        time, frequencies, power = _read_power(file)
+        subject = file_trials['subject'].iloc[0]  # one file = one session of one subject
+        for condition, condition_trials in file_trials.groupby('condition', sort=False):
+            session_maps[condition][subject].append(_session_means(power, condition_trials, flip))
+
     result = {}
-    for condition in conditions:
-        subjects = np.array(sorted(subject for c, subject in weights if c == condition))
-        values = {measure: {group: np.stack([
-            sums[condition, subject, measure, group]/weights[condition, subject]
-            for subject in subjects]) for group in groups} for measure in measures}
-        if 'contra' in groups and 'ipsi' in groups:
-            for measure in measures:
-                values[measure]['difference'] = values[measure]['contra']-values[measure]['ipsi']
-        names = {key[2] for key in response_times if key[0] == condition}
-        rt = {name: {subject: np.concatenate(response_times[condition, subject, name])
-                     for subject in subjects} for name in names}
-        result[condition] = dict(subjects=subjects, time=time, frequencies=frequencies, values=values, counts={subject: counts[condition, subject] for subject in subjects}, rt=rt)
+    for condition in sorted(session_maps):
+        subjects = sorted(session_maps[condition])
+        values = {}
+        for measure in MEASURES:
+            values[measure] = {}
+            for group in LINE_GROUPS:
+                subject_maps = [_subject_mean(session_maps[condition][s], (measure, group))
+                                for s in subjects]
+                values[measure][group] = np.stack(subject_maps)  # subjects × frequencies × times
+            values[measure]['difference'] = values[measure]['contra'] - values[measure]['ipsi']
+        result[condition] = dict(subjects=np.array(subjects), time=time, frequencies=frequencies,
+                                 values=values)
     return result
 
 
-def cluster_test(values, *, alpha=.05, n_perm=5000, seed=42):
-    """Two-sided one-sample cluster test on subjects × [frequencies ×] times."""
-    threshold = stats.t.ppf(1-alpha/2, len(values)-1)
+# ---------------------------------------------------------------- statistics
+
+def cluster_test(values, *, n_perm, seed, alpha, correction=1):
+    """Test subject values against zero with a two-sided cluster permutation test.
+
+    Args:
+        values: subjects × times, or subjects × frequencies × times.
+        n_perm: number of permutations.
+        seed: random seed of the permutations.
+        alpha: significance level; also sets the t threshold that forms clusters.
+        correction: Bonferroni correction factor (number of tests); 1: no correction.
+
+    Returns:
+        (mask, details): mask has the shape of one subject's values and is True inside
+        significant clusters; details is [{'indices', 'p'}] for every cluster.
+    """
+    threshold = stats.t.ppf(1-alpha/2, len(values)-1)  # t value that forms clusters
     _, clusters, p_values, _ = permutation_cluster_1samp_test(
         values, threshold=threshold, n_permutations=n_perm, tail=0,
         n_jobs=1, seed=seed, out_type='indices', verbose=False)
     mask = np.zeros(values.shape[1:], dtype=bool)
     details = []
     for indices, p in zip(clusters, p_values):
-        if p < alpha:
+        if p*correction < alpha:
             mask[indices] = True
         details.append({'indices': indices, 'p': float(p)})
     return mask, details
 
 
-def print_clusters(details, time, *, time_zero, frequencies=None, alpha=.05, correction=1):
-    """Print significant clusters, or the minimum-p cluster labeled non-significant."""
-    selected = [item for item in details if min(item['p']*correction, 1.) < alpha]
+def print_clusters(details, time, *, time_zero, alpha, frequencies=None, correction=1):
+    """Print the time / frequency range and p of each significant cluster, or of the lowest-p one.
+
+    Args:
+        details: cluster details from cluster_test.
+        time: times (s) of the tested values.
+        time_zero: time (s) printed as 0 ms.
+        alpha: significance level.
+        frequencies: frequencies (Hz) of the tested values; None for time courses.
+        correction: Bonferroni correction factor; if > 1, corrected p-values are printed too.
+    """
+    selected = [item for item in details if item['p']*correction < alpha]
     if not selected:
         if not details:
             print('No clusters found; no cluster time window or p-value to report.')
@@ -90,7 +168,6 @@ def print_clusters(details, time, *, time_zero, frequencies=None, alpha=.05, cor
         selected = [min(details, key=lambda item: item['p'])]
         print('No significant clusters. Minimum-p cluster (not significant):')
     for item in selected:
-        corrected_p = min(item['p']*correction, 1.)
         indices = item['indices']
         times = (time[indices[-1]]-time_zero)*1000
         text = f'time=[{times.min():.1f}, {times.max():.1f}] ms'
@@ -99,304 +176,261 @@ def print_clusters(details, time, *, time_zero, frequencies=None, alpha=.05, cor
             text += f', freq=[{ff.min():.1f}, {ff.max():.1f}] Hz'
         text += f", p={item['p']:.4g}"
         if correction > 1:
-            text += f', Bonferroni p={corrected_p:.4g}'
+            text += f", Bonferroni p={min(item['p']*correction, 1.):.4g}"
         print(text)
 
 
-def _style(fig, axes, *, time_zero):
-    for ax in np.asarray(axes).flat:
-        start, stop = ax.get_xlim()
-        ticks = MaxNLocator(nbins=5, steps=[1, 2, 2.5, 5, 10]).tick_values(
-            (start-time_zero)*1000, (stop-time_zero)*1000)
-        ticks = ticks[(ticks >= (start-time_zero)*1000) & (ticks <= (stop-time_zero)*1000)]
-        ax.set_xticks(time_zero+ticks/1000)
-        ax.xaxis.set_major_formatter(FuncFormatter(lambda value, pos: f'{(value-time_zero)*1000:g}'))
-        ax.tick_params(labelsize=12, width=1.2)
-        ax.spines[['top', 'right']].set_visible(False)
-        for spine in ax.spines.values():
-            spine.set_linewidth(1.2)
-        ax.title.set(fontsize=11, fontweight='bold')
-        ax.xaxis.label.set(fontsize=13, fontweight='bold')
-        ax.yaxis.label.set(fontsize=13, fontweight='bold')
-    if fig._suptitle is not None:
-        fig._suptitle.set(fontsize=13, fontweight='bold')
+def _mean_ci95(values):
+    """Mean over subjects (axis 0) and the half-width of its 95% t confidence interval."""
+    mean = values.mean(axis=0)
+    sem = values.std(axis=0, ddof=1)/np.sqrt(len(values))
+    return mean, stats.t.ppf(.975, len(values)-1)*sem
 
 
-def _events(ax, *, events, stimulus_bars, t_start, t_stop, labels, hide_right_label, rt_lines,
-            label_rows=1, label_y=-.22, label_fontsize=10):
-    label_index = 0
-    for onset, label in events:
-        if t_start <= onset <= t_stop:
-            ax.axvline(onset, color='.3', ls='--', lw=.9, alpha=.45)
-            if labels and not (hide_right_label and np.isclose(onset, t_stop)):
-                alignment = 'left' if np.isclose(onset, t_start) or np.isclose(onset, t_stop) else 'center'
-                ax.annotate(label, (onset, label_y), xycoords=ax.get_xaxis_transform(),
-                        xytext=(0, -16*(label_index % label_rows)), textcoords='offset points',
-                        ha=alignment, va='top', rotation=0, fontsize=label_fontsize,
-                        fontweight='bold', annotation_clip=False)
-                label_index += 1
-    bars = [(max(start, t_start), min(start+width, t_stop)-max(start, t_start))
-            for start, width in stimulus_bars if min(start+width, t_stop)>max(start, t_start)]
+# ---------------------------------------------------------------- drawing helpers
+
+def _style_axis(ax, *, time_zero):
+    """Show the time axis in ms relative to time_zero and apply the shared axis style."""
+    start, stop = ax.get_xlim()
+    low, high = (start-time_zero)*1000, (stop-time_zero)*1000
+    ticks = MaxNLocator(nbins=5, steps=[1, 2, 2.5, 5, 10]).tick_values(low, high)
+    ticks = ticks[(ticks >= low) & (ticks <= high)]
+    ax.set_xticks(time_zero+ticks/1000)
+    ax.xaxis.set_major_formatter(FuncFormatter(lambda value, _: f'{(value-time_zero)*1000:g}'))
+    ax.tick_params(labelsize=12, width=1.2)
+    ax.spines[['top', 'right']].set_visible(False)
+    for spine in ax.spines.values():
+        spine.set_linewidth(1.2)
+    ax.yaxis.label.set(fontsize=13, fontweight='bold')
+
+
+def _draw_events(ax, *, events, t_start, t_stop, rt_lines, labels, label_y=-.22, fontsize=10):
+    """Draw the task events and RT lines on one axis and set its time window (y-range unchanged).
+
+    Args:
+        ax: the axis.
+        events: [(onset s, duration s, label)]: a dashed line at the onset, a gray bar below
+            the axis for the duration, and the label below the axis if `labels`.
+        t_start, t_stop: time window (s); events outside it are skipped.
+        rt_lines: [(time s, color)]: colored dashed lines, e.g. mean RTs.
+        labels: True to write the event labels (only the bottom row of a figure needs them).
+        label_y: height of the labels in axis units (negative: below the axis).
+        fontsize: font size of the labels.
+    """
+    for onset, _, label in events:
+        if not t_start <= onset <= t_stop:
+            continue
+        ax.axvline(onset, color='.3', ls='--', lw=.9, alpha=.45)
+        if labels:
+            at_edge = np.isclose(onset, t_start) or np.isclose(onset, t_stop)
+            ax.text(onset, label_y, label, transform=ax.get_xaxis_transform(),
+                    ha='left' if at_edge else 'center', va='top',
+                    fontsize=fontsize, fontweight='bold', clip_on=False)
+    bars = []  
+    for onset, duration, _ in events:
+        left, right = max(onset, t_start), min(onset+duration, t_stop)
+        if right > left:
+            bars.append((left, right-left))
+    y_limits = ax.get_ylim()
     ax.broken_barh(bars, (-.05, .05), facecolors='gray', alpha=.4,
                    transform=ax.get_xaxis_transform(), clip_on=False)
-    for index, (onset, color, label) in enumerate(rt_lines):
+    ax.set_ylim(y_limits)  
+    for index, (onset, color) in enumerate(rt_lines):
         if t_start <= onset <= t_stop:
-            # Alternate dash positions so coincident RT lines remain visible.
             ax.axvline(onset, color=color, ls=(3*(index % 2), (3, 3)),
-                       lw=2, label='_nolegend_', zorder=5, dash_capstyle='butt')
+                       lw=2, zorder=5, dash_capstyle='butt')
     ax.set_xlim(t_start, t_stop)
 
 
-def _save(fig, output_dir, name, *, t_start, t_stop, time_zero, output_format='png'):
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    tag = f'{t_start:g}-{t_stop:g}s_zero-{time_zero:g}s'.replace('.', 'p')
-    path = output_dir/f'{name}_{tag}.{output_format}'
-    if output_format == 'svg':
-        # Matplotlib rasterizes colorbar meshes by default; keep them vector too.
-        for artist in fig.findobj():
-            if artist.get_rasterized():
-                artist.set_rasterized(False)
-    fig.savefig(path, dpi=200, bbox_inches='tight')
-    print(f'[saved] {path}')
-    return path
-
-
-def _mean_ci95(values):
-    mean = values.mean(axis=0)
-    sem = values.std(axis=0, ddof=1)/np.sqrt(len(values))
-    width = stats.t.ppf(.975, len(values)-1)*sem
-    return mean, width
-
-
 def _sig_lane(ax, mask, time, *, lane, color):
+    """Draw a bar above the axis where mask is True; each test (lane) gets its own height."""
     edges = np.diff(np.r_[0, mask.astype(int), 0])
-    for start, stop in zip(np.where(edges==1)[0], np.where(edges==-1)[0]):
+    for start, stop in zip(np.where(edges == 1)[0], np.where(edges == -1)[0]):
         ax.plot([time[start], time[stop-1]], [1.035+.07*lane]*2,
                 color=color, lw=3, transform=ax.get_xaxis_transform(), clip_on=False)
 
 
-def plot_tf_maps(data, *, measures, t_start, t_stop, time_zero, events,
-                 stimulus_bars, output_dir, name, fmax=30,
-                 limits, diff_limits, cmap='coolwarm',
-                 combine_measures=False, panel_size=(6.4, 4.8), show_sides=True,
-                 rt_lines=(), run_cluster=True, n_perm=5000, seed=42, alpha=.05,
-                 output_format='png'):
-    """TF maps: groups in rows, combined directions in columns.
+def _colorbar_extend(values, limit):
+    """Which colorbar ends get an arrow because values lie beyond ±limit."""
+    below, above = np.any(values < -limit), np.any(values > limit)
+    return 'both' if below and above else 'min' if below else 'max' if above else 'neither'
 
-    show_sides=False plots/tests only contra-minus-ipsi.
-    panel_size is (width, height) in inches; combined result key is 'fw_bw'.
+
+def _save(fig, output_dir, name, *, t_start, t_stop, time_zero):
+    """Save the figure as output_dir/<name>_<time window>.png."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    window = f'{t_start:g}-{t_stop:g}s_zero-{time_zero:g}s'.replace('.', 'p')
+    path = output_dir/f'{name}_{window}.png'
+    fig.savefig(path, dpi=200, bbox_inches='tight')
+    print(f'[saved] {path}')
+
+
+# ---------------------------------------------------------------- figures
+
+def plot_tf_maps(maps, *, color_limit, t_start, t_stop, time_zero, events, output_dir, name,
+                 n_perm, seed, alpha, rt_lines=()):
+    """Plot and save contra − ipsi TF maps up to 30 Hz (fw left, bw right); print the clusters.
+
+    Args:
+        maps: {'subjects': subject ids, 'time': s, 'frequencies': Hz,
+                'values': {'fw' / 'bw': {group: subjects × frequencies × times, dB}}}.
+        color_limit: color bar.
+        t_start, t_stop: time window to plot and test (s).
+        time_zero: time (s) shown as 0 ms on the time axis.
+        events: [(onset s, duration s, label)] task events.
+        output_dir: folder for the figure.
+        name: <name>_fw_bw_tf_difference_<time window>.png.
+        n_perm, seed, alpha: cluster test settings.
+        rt_lines: [(time s, color)] colored dashed lines.
     """
-    time_mask = (data['time']>=t_start)&(data['time']<=t_stop)
-    frequency_mask = data['frequencies']<=fmax
-    time, frequencies = data['time'][time_mask], data['frequencies'][frequency_mask]
-    results = {}
-    figures = [list(measures)] if combine_measures else [[measure] for measure in measures]
-    figure_groups = [(('difference',), 'difference')]
-    if show_sides:
-        figure_groups.insert(0, (('contra', 'ipsi', 'mid'), 'sides'))
-    for figure_measures in figures:
-        tag = '_'.join(figure_measures)
-        results[tag] = {}
-        for groups, suffix in figure_groups:
-            nrows, ncols = len(groups), len(figure_measures)
-            fig, axes = plt.subplots(nrows, ncols,
-                                     figsize=(panel_size[0]*ncols, panel_size[1]*nrows),
-                                     sharex=True, sharey=True, squeeze=False)
-            details_by_measure = {measure: {} for measure in figure_measures}
-            panels = [(row, col, group, measure) for row, group in enumerate(groups)
-                      for col, measure in enumerate(figure_measures)]
-            for row, col, group, measure in panels:
-                ax = axes[row,col]
-                values = data['values'][measure][group][:, frequency_mask][:, :, time_mask]
-                scale = diff_limits[measure] if group=='difference' else limits[measure]
-                mean = values.mean(axis=0)
-                image = ax.pcolormesh(time, frequencies, mean,
-                    shading='auto', cmap=cmap, vmin=-scale, vmax=scale)
-                below, above = np.any(mean < -scale), np.any(mean > scale)
-                extend = 'both' if below and above else 'min' if below else 'max' if above else 'neither'
-                colorbar = fig.colorbar(image, ax=ax, pad=.025, fraction=.045,
-                                       aspect=22, extend=extend)
-                colorbar.set_label('Mean power (dB)', fontsize=10)
-                colorbar.ax.tick_params(labelsize=9)
-                details = []
-                if run_cluster:
-                    sig, details = cluster_test(values, n_perm=n_perm, seed=seed, alpha=alpha)
-                    if sig.any() and not sig.all():
-                        ax.contour(time,frequencies,sig.astype(float),levels=[.5],colors='black',linewidths=1.5)
-                    print(f'[{name} | {measure} | {group}]')
-                    print_clusters(details,time,time_zero=time_zero,frequencies=frequencies,alpha=alpha)
-                details_by_measure[measure][group] = details
-                title = {'contra':'Contra', 'ipsi':'Ipsi', 'mid':'Midline', 'difference':''}[group]
-                title = DIRECTION_TITLES[measure] + (f' · {title}' if title else '')
-                ax.set(title=title, ylabel='Frequency (Hz)')
-                frequency_limits = ax.get_ylim()
-                _events(ax,events=events,stimulus_bars=stimulus_bars,t_start=t_start,t_stop=t_stop,
-                        labels=row==nrows-1, hide_right_label=False, rt_lines=rt_lines,
-                        label_y=-.14)
-                ax.set_ylim(frequency_limits)
-                ax.tick_params(labelleft=True)
-            _style(fig,axes,time_zero=time_zero)
-            for ax in axes.flat:
-                ax.set_title(ax.get_title(), fontsize=13, fontweight='bold', pad=12)
-            fig.subplots_adjust(left=.7/fig.get_figwidth(), right=1-.75/fig.get_figwidth(),
-                                bottom=.8/fig.get_figheight(), top=1-.45/fig.get_figheight(),
-                                hspace=.28, wspace=.45)
-            path = _save(fig,output_dir,f'{name}_{tag}_tf_{suffix}',t_start=t_start,t_stop=t_stop,time_zero=time_zero,output_format=output_format)
-            details = (details_by_measure[figure_measures[0]] if len(figure_measures)==1
-                       else details_by_measure)
-            results[tag][suffix] = dict(figure=fig,axes=axes,path=path,clusters=details)
-            plt.show()
-    return results
+    in_window = (maps['time'] >= t_start) & (maps['time'] <= t_stop)
+    in_range = maps['frequencies'] <= 30  # Hz
+    time, frequencies = maps['time'][in_window], maps['frequencies'][in_range]
+    fig, axes = plt.subplots(1, len(MEASURES), figsize=(12.8, 4.8))
+    for ax, measure in zip(axes, MEASURES):
+        # subjects × frequencies × times, cut to ≤ 30 Hz and the time window
+        values = maps['values'][measure]['difference'][:, in_range][:, :, in_window]
+        mean = values.mean(axis=0)  # average over subjects (axis 0): frequencies × times
+        image = ax.pcolormesh(time, frequencies, mean, shading='auto', cmap='coolwarm',
+                              vmin=-color_limit, vmax=color_limit)
+        colorbar = fig.colorbar(image, ax=ax, pad=.025, fraction=.045, aspect=22,
+                                extend=_colorbar_extend(mean, color_limit))
+        colorbar.set_label('Mean power (dB)', fontsize=10)
+        colorbar.ax.tick_params(labelsize=9)
+
+        significant, details = cluster_test(values, n_perm=n_perm, seed=seed, alpha=alpha)
+        if significant.any():  # contour() warns when there is nothing to outline
+            ax.contour(time, frequencies, significant.astype(float), levels=[.5],
+                       colors='black', linewidths=1.5)
+        print(f'[{name} | {measure} | difference]')
+        print_clusters(details, time, time_zero=time_zero, alpha=alpha, frequencies=frequencies)
+
+        ax.set_title(DIRECTION_TITLES[measure], fontsize=13, fontweight='bold', pad=12)
+        ax.set_ylabel('Frequency (Hz)')
+        _draw_events(ax, events=events, t_start=t_start, t_stop=t_stop, rt_lines=rt_lines,
+                     labels=True, label_y=-.14)
+        _style_axis(ax, time_zero=time_zero)
+    width, height = fig.get_size_inches()
+    fig.subplots_adjust(left=.7/width, right=1-.75/width, bottom=.8/height, top=1-.45/height,
+                        wspace=.45)
+    _save(fig, output_dir, f'{name}_fw_bw_tf_difference', t_start=t_start, t_stop=t_stop,
+          time_zero=time_zero)
+    plt.show()
 
 
-def plot_band_timeseries(data, *, group, measures, freq_bands, t_start,
-                         t_stop, time_zero, events, stimulus_bars, output_dir,
-                         name, ylims, tests=None, split_measures=True,
-                         correction=1, colors=None, legend_title=None,
-                         measure_linestyles=None, bands_as_rows=False,
-                         combine_measures=False, measure_layout='vertical', line_width=3,
-                         panel_size=None,
-                         legend_layout='top', comparison_colors=None,
-                         rt_lines=(), hide_right_event_label=False, event_label_rows=1,
-                         event_label_fontsize=10,
-                         run_cluster=True, n_perm=5000, seed=42, alpha=.05,
-                         output_format='png'):
-    """Band time courses with pointwise 95% CIs; paired inputs must share subject and time ordering.
+def plot_band_timeseries(conditions, *, group, freq_bands, ylim, t_start, t_stop, time_zero,
+                         events, output_dir, name, n_perm, seed, alpha, tests=None, bonferroni=False,
+                         layout='rows', legend_title=None, colors=None,
+                         panel_size=None, event_fontsize=10, rt_lines=()):
+    """Plot and save band-power time courses (mean ± 95% CI) with cluster bars; print the clusters.
 
-    tests: (condition, None) against zero, or two paired conditions.
-    combine_measures uses measure_layout='vertical' or 'horizontal'.
-    panel_size is in inches; correction applies across the requested tests.
+    Args:
+        conditions: {condition: maps} from average_maps; one curve per
+            condition. For a single condition pass {'all': maps}.
+        group: 'difference' (contra − ipsi), 'midline' or 'all_lines' .
+        freq_bands: FREQ_BANDS or some of its bands.
+        ylim: (bottom, top) of the power axis, in dB.
+        t_start, t_stop: time window to plot and test (s).
+        time_zero: time (s) shown as 0 ms on the time axis.
+        events: [(onset s, duration s, label)] task events.
+        output_dir: output folder for the figure.
+        name:  <name>_fw_bw_bands_<time window>.png.
+        n_perm, seed, alpha: cluster test settings.
+        tests: (condition, None): condition vs 0; (condition, condition): difference vs 0;
+            None: every condition vs 0.
+        bonferroni: True : bonferroni correction; False: no correction.
+        layout: 'rows': fw / bw in rows, bands in columns; 'columns': the other way round.
+        legend_title: title of the condition legend, or None.
+        colors: {condition: curve color, (condition, condition): difference bar color}.
+        panel_size: (width, height) of one panel in inches; None: chosen from layout.
+        event_fontsize: font size of the event labels.
+        rt_lines: [(time s, color)] colored dashed lines, e.g. mean RTs.
     """
-    if combine_measures:
-        split_measures = False
-        bands_as_rows = {'vertical': False, 'horizontal': True}[measure_layout]
-    direction_columns = combine_measures and measure_layout == 'horizontal'
-    conditions = {'all': data} if 'subjects' in data else data
     if tests is None:
         tests = [(condition, None) for condition in conditions]
-    for first, second in tests:
-        if first not in conditions or (second is not None and second not in conditions):
-            raise ValueError(f'No valid data for requested comparison: {first}, {second}')
-        if second is not None:
-            for key in ('subjects', 'time', 'frequencies'):
-                if not np.array_equal(conditions[first][key], conditions[second][key]):
-                    raise ValueError(f'Paired conditions must have matching {key}: {first}, {second}')
-    palette = plt.rcParams['axes.prop_cycle'].by_key()['color']
-    condition_colors = {key: palette[i%len(palette)] for i,key in enumerate(conditions)}
-    if colors is not None:
-        condition_colors.update(colors)
-    measure_colors = {'fw': '#1f77b4', 'bw': '#ff7f0e'}
-    figures = [[measure] for measure in measures] if split_measures else [list(measures)]
-    result = {}
-    for figure_measures in figures:
-        shape = (len(freq_bands),len(figure_measures)) if bands_as_rows else (len(figure_measures),len(freq_bands))
-        side_legend = legend_layout == 'right'
-        height = 4.8 if side_legend or direction_columns else 4.2
-        width = 6.4 if direction_columns else 4.8
-        if panel_size is not None:
-            width, height = panel_size
-        fig,axes=plt.subplots(*shape,figsize=(width*shape[1]+(2.2 if side_legend else 0),height*shape[0]),squeeze=False,sharex=True)
-        all_stats={}
-        comparison_handles = {}
-        for mi,measure in enumerate(figure_measures):
-            for bi,(lo,hi,band_name) in enumerate(freq_bands):
-                ax=axes[bi,mi] if bands_as_rows else axes[mi,bi]
-                band_data={}
-                times={}
-                for condition,data in conditions.items():
-                    tm=(data['time']>=t_start)&(data['time']<=t_stop)
-                    fm=(data['frequencies']>=lo)&(data['frequencies']<=hi)
-                    values=data['values'][measure][group][:,fm][:,:,tm].mean(axis=1)
-                    time=data['time'][tm]
-                    times[condition]=time
-                    band_data[condition]=values
-                    mean,width=_mean_ci95(values)
-                    color=measure_colors[measure] if len(conditions)==1 else condition_colors[condition]
-                    linestyle='-' if measure_linestyles is None else measure_linestyles[measure]
-                    ax.plot(time,mean,color=color,ls=linestyle,lw=line_width,
-                            label=str(condition) if len(conditions)>1 else '_nolegend_')
-                    ax.fill_between(time,mean-width,mean+width,color=color,alpha=.32,lw=0, zorder=1)
-                panel_stats=[]
-                for ti,(first,second) in enumerate(tests):
-                    if not run_cluster:
-                        break
-                    data=conditions[first]
-                    values=band_data[first]
-                    subject_ids=data['subjects']
-                    if second is not None:
-                        values=values-band_data[second]
-                    _,details=cluster_test(values,n_perm=n_perm,seed=seed+1000*measures.index(measure)+100*bi+ti,alpha=alpha)
-                    label=str(first) if second is None else f'{first} − {second}'
-                    print(f'[{name} | {measure} | {band_name} | {label}]')
-                    print_clusters(details,times[first],time_zero=time_zero,alpha=alpha,correction=correction)
-                    sig=np.zeros(len(times[first]),bool)
-                    for item in details:
-                        if item['p']*correction<alpha:
-                            sig[item['indices'][0]]=True
-                    color=measure_colors[measure] if len(conditions)==1 else condition_colors[first]
-                    if second is not None:
-                        color = 'black' if comparison_colors is None else comparison_colors[ti % len(comparison_colors)]
-                        unit = '°' if legend_title == 'Rotation (°)' else ''
-                        comparison = f'{first}{unit} vs {second}{unit}'
-                        comparison_handles.setdefault(comparison, Line2D(
-                            [], [], color=color, lw=3, label=comparison))
-                    _sig_lane(ax,sig,times[first],lane=ti,color=color)
-                    panel_stats.append(dict(test=(first,second),subjects=subject_ids,clusters=details,correction=correction))
-                all_stats[measure,band_name]=panel_stats
-                ax.axhline(0,color='.5',ls='--',lw=.8)
-                ax.set_ylim(*ylims[measure])
-                ax.set_ylabel('Power (dB)')
-                title = f'{DIRECTION_TITLES[measure]}\n{band_name}' if direction_columns and bi==0 else band_name
-                ax.set_title(title, pad=25+10*(len(tests)-1))
-                _events(ax,events=events,stimulus_bars=stimulus_bars,t_start=t_start,t_stop=t_stop,
-                        labels=(bi==shape[0]-1 if bands_as_rows else mi==shape[0]-1),
-                        hide_right_label=hide_right_event_label,rt_lines=rt_lines,
-                        label_rows=event_label_rows, label_fontsize=event_label_fontsize)
-        if len(figure_measures) == 1 and not direction_columns:
-            fig.suptitle(DIRECTION_TITLES[figure_measures[0]])
-        _style(fig,axes,time_zero=time_zero)
-        header_height = 1.35 if side_legend else (1.55 if len(figure_measures)>1 or legend_title else 1.25)
-        if direction_columns and not side_legend:
-            header_height = 1.55 if len(conditions)>1 or legend_title else 1.0
-        fig.subplots_adjust(bottom=(.8+(event_label_rows-1)*16/72)/(height*shape[0]),
-                            top=1-header_height/(height*shape[0]),
-                            right=1-2.2/fig.get_figwidth() if side_legend else .9,
-                            hspace=1.1,wspace=.3)
-        if len(conditions)>1:
-            legend_entries = {}
-            for axis in axes.flat:
-                handles, labels = axis.get_legend_handles_labels()
-                for handle, label in zip(handles, labels):
-                    legend_entries.setdefault(label, handle)
-            if not side_legend and comparison_handles:
-                if len(comparison_handles) == 1:
-                    legend_entries['Difference'] = next(iter(comparison_handles.values()))
+    correction = len(tests) if bonferroni else 1
+    single = len(conditions) == 1
+
+    directions_in_columns = layout == 'columns'
+    nrows, ncols = ((len(freq_bands), len(MEASURES)) if directions_in_columns
+                    else (len(MEASURES), len(freq_bands)))
+    width, height = panel_size or ((6.4, 4.8) if directions_in_columns else (4.8, 4.2))
+    fig, grid = plt.subplots(nrows, ncols, figsize=(width*ncols, height*nrows),
+                             squeeze=False, sharex=True)
+    bottom_row = list(grid[-1])  # only these panels get event labels
+    axes = grid.T if directions_in_columns else grid  # axes[direction_index, band_index]
+
+    first_maps = list(conditions.values())[0]  # every condition has the same time and frequencies
+    in_window = (first_maps['time'] >= t_start) & (first_maps['time'] <= t_stop)
+    time = first_maps['time'][in_window]
+    for direction_index, measure in enumerate(MEASURES):
+        for band_index, (low, high, band_name) in enumerate(freq_bands):
+            band = f'{band_name} ({low}–{high} Hz)'
+            ax = axes[direction_index, band_index]
+            in_band = (first_maps['frequencies'] >= low) & (first_maps['frequencies'] <= high)
+            band_power = {}
+            for condition, maps in conditions.items():
+                # subjects × frequencies × times → subjects × times 
+                values = maps['values'][measure][group][:, in_band][:, :, in_window].mean(axis=1)
+                band_power[condition] = values
+                mean, half_width = _mean_ci95(values)  # values: subjects × times
+                color = MEASURE_COLORS[measure] if single else colors[condition]
+                ax.plot(time, mean, color=color, lw=3)
+                ax.fill_between(time, mean-half_width, mean+half_width, color=color,
+                                alpha=.32, lw=0, zorder=1)
+
+            for test_index, (first, second) in enumerate(tests):
+                values = band_power[first] if second is None else band_power[first]-band_power[second]
+                significant, details = cluster_test(values, n_perm=n_perm, seed=seed,
+                                                    alpha=alpha, correction=correction)
+                label = str(first) if second is None else f'{first} − {second}'
+                print(f'[{name} | {measure} | {band} | {label}]')
+                print_clusters(details, time, time_zero=time_zero, alpha=alpha,
+                               correction=correction)
+                if second is None:
+                    color = MEASURE_COLORS[measure] if single else colors[first]
                 else:
-                    legend_entries.update(comparison_handles)
-            if legend_entries:
-                fig.legend(legend_entries.values(), legend_entries.keys(),
-                           loc='upper left' if side_legend else 'upper center',
-                           bbox_to_anchor=(1-2.05/fig.get_figwidth(), .86) if side_legend else (.5, .94),
-                           ncol=1 if side_legend else min(len(legend_entries), 4), frameon=False, fontsize=9,
-                           title=legend_title, title_fontsize=9)
-        if side_legend and comparison_handles:
-            fig.legend(handles=list(comparison_handles.values()),
-                       loc='upper left', bbox_to_anchor=(1-2.05/fig.get_figwidth(), .58),
-                       ncol=1, frameon=False,
-                       fontsize=9, title='Difference',
-                       title_fontsize=9)
-        if len(figure_measures) > 1 and not direction_columns:
-            for index, measure in enumerate(figure_measures):
-                axis = axes[0,index] if bands_as_rows else axes[index,0]
-                x = axis.get_position().x0 + axis.get_position().width/2 if bands_as_rows else .5
-                y = axis.get_position().y1 + (55+10*(len(tests)-1))/72/fig.get_figheight()
-                if bands_as_rows or index == 0:
-                    y = .98
-                fig.text(x,y,DIRECTION_TITLES[measure],ha='center',va='bottom',
-                         fontsize=13,fontweight='bold')
-        tag='_'.join(figure_measures)
-        path=_save(fig,output_dir,f'{name}_{tag}_bands',t_start=t_start,t_stop=t_stop,time_zero=time_zero,output_format=output_format)
-        result[tag]=dict(figure=fig,axes=axes,path=path,statistics=all_stats)
-        plt.show()
-    return result
+                    color = colors.get((first, second), 'black')
+                _sig_lane(ax, significant, time, lane=test_index, color=color)
+
+            ax.axhline(0, color='.5', ls='--', lw=.8)
+            ax.set_ylim(*ylim)
+            ax.set_ylabel('Power (dB)')
+            title = f'{DIRECTION_TITLES[measure]}\n{band}' if directions_in_columns and band_index == 0 else band
+            ax.set_title(title, pad=25+10*(len(tests)-1), fontsize=11, fontweight='bold')
+            _draw_events(ax, events=events, t_start=t_start, t_stop=t_stop, rt_lines=rt_lines,
+                         labels=ax in bottom_row, fontsize=event_fontsize)
+    for ax in axes.flat:
+        _style_axis(ax, time_zero=time_zero)
+
+    # Space (in inches) above the panels for legend and direction titles.
+    header = 1.0 if directions_in_columns and single else 1.55
+    fig_width, fig_height = fig.get_size_inches()
+    fig.subplots_adjust(bottom=.8/fig_height, top=1-header/fig_height, right=.9,
+                        hspace=1.1, wspace=.3)
+
+    if not single:
+        # One legend entry per condition (curve color), then one per comparison (bar color).
+        labels = [str(condition) for condition in conditions]
+        line_colors = [colors[condition] for condition in conditions]
+        comparisons = [(first, second) for first, second in tests if second is not None]
+        for first, second in comparisons:
+            labels.append('Difference' if len(comparisons) == 1 else f'{first} vs {second}')
+            line_colors.append(colors.get((first, second), 'black'))
+        handles = [Line2D([], [], color=color, lw=3) for color in line_colors]
+        fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(.5, 1-.25/fig_height),
+                   ncol=len(labels), frameon=False, fontsize=9,
+                   title=legend_title, title_fontsize=9)
+
+    if not directions_in_columns:
+        # Direction titles above each row; the first sits at the top of the figure.
+        for direction_index, measure in enumerate(MEASURES):
+            y = .98 if direction_index == 0 else (axes[direction_index, 0].get_position().y1
+                                                  + (55+10*(len(tests)-1))/72/fig_height)
+            fig.text(.5, y, DIRECTION_TITLES[measure], ha='center', va='bottom',
+                     fontsize=13, fontweight='bold')
+
+    _save(fig, output_dir, f'{name}_fw_bw_bands', t_start=t_start, t_stop=t_stop,
+          time_zero=time_zero)
+    plt.show()
